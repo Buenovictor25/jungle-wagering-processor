@@ -3,14 +3,18 @@ services:
   postgres:
     image: postgres:16-alpine
     restart: unless-stopped
+
     environment:
       POSTGRES_USER: jungle
-      POSTGRES_PASSWORD: jungle_dev
+      POSTGRES_PASSWORD: jungle
       POSTGRES_DB: wagering
+
     ports:
       - "127.0.0.1:5433:5432"
+
     volumes:
       - postgres_data:/var/lib/postgresql/data
+
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U jungle -d wagering"]
       interval: 5s
@@ -18,15 +22,30 @@ services:
       retries: 10
 
   localstack:
-    image: localstack/localstack:3.8.1
+    build:
+      context: ./docker/localstack
+      dockerfile: Dockerfile
+
+    image: jungle-localstack:3.8.1
     restart: unless-stopped
+
     environment:
       SERVICES: sqs
       AWS_DEFAULT_REGION: us-east-1
+
     ports:
       - "127.0.0.1:4566:4566"
+
     volumes:
       - localstack_data:/var/lib/localstack
+
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://localhost:4566/_localstack/health || exit 1
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   postgres_data:
