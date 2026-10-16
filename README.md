@@ -2,7 +2,7 @@
 
 NestJS, Bun, TypeScript estrito, PostgreSQL 16, MikroORM 7 e SQS/LocalStack. BET, WIN, LOSS, REFUND e ROLLBACK com saldo decimal exato, ledger imutável, idempotência persistente e inbox/outbox atômicos.
 
-[Desafio oficial](https://github.com/junglegaming/backend-challenge) · [Decisões e limitações](ARCHITECTURE.md) · [Auditoria inicial](AUDIT.md) · [Validação final](VALIDATION.md)
+[Desafio oficial](https://github.com/junglegaming/backend-challenge) · [Decisões e limitações](ARCHITECTURE.md) · [Auditoria inicial](AUDIT.md) · [Validação final](VALIDATION.md) · [Auditoria de publicação](FINAL_AUDIT.md)
 
 ## Setup
 
@@ -11,7 +11,7 @@ Pré-requisitos: Bun 1.x (validado com 1.4.3), Docker/Compose. Na raiz do reposi
 ```powershell
 bun install --frozen-lockfile
 Copy-Item .env.example .env  # somente se ainda não existir
-docker compose up -d postgres localstack
+docker compose up -d --wait postgres localstack
 bun run db:migrate
 bun run queues:setup
 bun run start
