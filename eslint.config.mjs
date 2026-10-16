@@ -25,6 +25,13 @@ export default tseslint.config(
     },
   },
   {
+    files: ['test/**/*.ts'],
+    rules: {
+      // Bun's .rejects is asynchronous at runtime, but its matcher typings return void.
+      '@typescript-eslint/await-thenable': 'off',
+    },
+  },
+  {
     rules: {
       '@typescript-eslint/no-explicit-any': 'off',
       '@typescript-eslint/no-floating-promises': 'warn',
