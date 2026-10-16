@@ -21,5 +21,6 @@ export default defineConfig({
     allOrNothing: true,
   },
 
-  debug: process.env.NODE_ENV === 'development',
+  // Financial SQL parameters must never enter application logs.
+  debug: false,
 });

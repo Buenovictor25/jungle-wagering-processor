@@ -14,15 +14,20 @@ import {
   Injectable,
   OnApplicationBootstrap,
   OnApplicationShutdown,
+  BeforeApplicationShutdown,
 } from '@nestjs/common';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { ApplicationError, identifier, object } from '../application/contracts';
 import { query, WageringService } from '../application/wagering.service';
 import { Telemetry } from './telemetry';
+import { OutboxMessage } from '../domain/entities/message';
 
 @Injectable()
 export class Messaging
-  implements OnApplicationBootstrap, OnApplicationShutdown
+  implements
+    OnApplicationBootstrap,
+    OnApplicationShutdown,
+    BeforeApplicationShutdown
 {
   readonly sqs = new SQSClient({
     region: process.env.AWS_REGION ?? 'us-east-1',
@@ -32,6 +37,7 @@ export class Messaging
       secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY ?? 'test',
     },
     maxAttempts: 2,
+    requestHandler: { connectionTimeout: 2000, requestTimeout: 5000 },
   });
   queueUrl = '';
   queuePrefix = process.env.SQS_QUEUE_PREFIX ?? 'wager';
@@ -180,7 +186,7 @@ export class Messaging
           new SendMessageCommand({
             QueueUrl: this.dlqUrl,
             MessageBody: message.Body ?? '{}',
-            MessageGroupId: 'failed',
+            MessageGroupId: message.MessageId ?? 'failed',
             MessageDeduplicationId: message.MessageId ?? crypto.randomUUID(),
           }),
         );
@@ -223,6 +229,7 @@ export class Messaging
         `SELECT * FROM outbox WHERE published_at IS NULL AND next_attempt_at<=now() ORDER BY occurred_at LIMIT 20 FOR UPDATE SKIP LOCKED`,
       );
       for (const row of rows) {
+        const state = OutboxMessage.rehydrate(row.id, row.attempts, new Date());
         try {
           await this.sqs.send(
             new SendMessageCommand({
@@ -232,14 +239,17 @@ export class Messaging
               MessageDeduplicationId: row.id,
             }),
           );
+          state.markPublished(new Date());
           await em.execute(
-            'UPDATE outbox SET published_at=now(),attempts=attempts+1 WHERE id=?',
-            [row.id],
+            'UPDATE outbox SET published_at=?,attempts=? WHERE id=?',
+            [state.publishedAt, state.attempts, row.id],
           );
-        } catch {
+        } catch (error) {
+          if (state.publishedAt) throw error;
+          state.scheduleRetry(new Date());
           await em.execute(
-            `UPDATE outbox SET attempts=attempts+1,next_attempt_at=now()+(? * interval '1 second') WHERE id=?`,
-            [Math.min(300, 2 ** Math.min(row.attempts + 1, 9)), row.id],
+            `UPDATE outbox SET attempts=?,next_attempt_at=? WHERE id=?`,
+            [state.attempts, state.nextAttemptAt, row.id],
           );
           this.telemetry.increment('retries_total');
         }
@@ -260,10 +270,13 @@ export class Messaging
     );
     return { status: 'ready' };
   }
-  async onApplicationShutdown() {
+  async beforeApplicationShutdown() {
     this.stopping = true;
     if (this.timer) clearTimeout(this.timer);
     await this.active;
+  }
+  async onApplicationShutdown() {
+    await this.beforeApplicationShutdown();
     this.sqs.destroy();
   }
 }

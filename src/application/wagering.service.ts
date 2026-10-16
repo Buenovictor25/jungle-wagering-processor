@@ -3,6 +3,8 @@ import { Injectable } from '@nestjs/common';
 import { EntityManager, MikroORM } from '@mikro-orm/postgresql';
 import { Money, MoneyProps } from '../domain/value-objects/money';
 import { Wallet } from '../domain/entities/wallet';
+import { WagerRules } from '../domain/wager-rules';
+import { InboxMessage } from '../domain/entities/message';
 import {
   LedgerDirection,
   WalletLedgerEntry,
@@ -70,6 +72,7 @@ export class WageringService {
   private transaction<T>(work: (em: EntityManager) => Promise<T>): Promise<T> {
     return this.orm.em.fork().transactional(async (em) => {
       await em.execute(`SET LOCAL lock_timeout = '5s'`);
+      await em.execute(`SET LOCAL statement_timeout = '10s'`);
       return work(em);
     });
   }
@@ -209,9 +212,17 @@ export class WageringService {
     id: string,
   ) {
     if (!messageId) return;
+    const inbox = InboxMessage.receive(identifier(messageId), 'wagering', hash);
+    inbox.markProcessed(new Date());
     await em.execute(
-      `INSERT INTO inbox(consumer_name,message_id,payload_hash,transaction_id) VALUES ('wagering',?,?,?) ON CONFLICT DO NOTHING`,
-      [identifier(messageId), hash, id],
+      `INSERT INTO inbox(consumer_name,message_id,payload_hash,transaction_id,received_at,processed_at) VALUES ('wagering',?,?,?,?,?) ON CONFLICT DO NOTHING`,
+      [
+        inbox.messageId,
+        inbox.payloadHash,
+        id,
+        inbox.receivedAt,
+        inbox.processedAt,
+      ],
     );
     const [existing] = await query<{
       payload_hash: string;
@@ -252,8 +263,7 @@ export class WageringService {
     let failure: string | undefined;
     let reference: TransactionRow | undefined;
     let waiting = false;
-    let direction =
-      p.kind === 'BET' ? LedgerDirection.Debit : LedgerDirection.Credit;
+    let direction = WagerRules.direction(p.kind);
     if (p.playerId !== wallet.playerId) failure = 'PLAYER_MISMATCH';
     else if (money.currency !== wallet.currency) failure = 'CURRENCY_MISMATCH';
     if (!failure && p.referenceExternalTransactionId) {
@@ -275,38 +285,19 @@ export class WageringService {
         }
       } else if (reference.status !== 'PROCESSED')
         failure = 'REFERENCE_NOT_PROCESSED';
-      else if (
-        reference.wallet_id !== p.walletId ||
-        reference.payload.playerId !== p.playerId ||
-        reference.payload.roundId !== p.roundId ||
-        reference.payload.money.currency !== p.money.currency
-      )
-        failure = 'REFERENCE_MISMATCH';
-      else if (
-        (p.kind === 'REFUND' || p.kind === 'WIN' || p.kind === 'LOSS') &&
-        reference.kind !== 'BET'
-      )
-        failure = 'INVALID_REFERENCE_KIND';
-      else if (
-        p.kind === 'ROLLBACK' &&
-        !['BET', 'WIN', 'REFUND'].includes(reference.kind)
-      )
-        failure = 'INVALID_REFERENCE_KIND';
-      else if (['REFUND', 'ROLLBACK'].includes(p.kind)) {
-        if (!money.equals(Money.from(reference.payload.money)))
-          failure = 'REVERSAL_AMOUNT_MISMATCH';
-        else {
+      else {
+        failure = WagerRules.referenceFailure(
+          { ...p, money },
+          { ...reference.payload, money: Money.from(reference.payload.money) },
+        );
+        if (!failure && ['REFUND', 'ROLLBACK'].includes(p.kind)) {
           const reversed = await query(
             em,
             `SELECT id FROM wager_transactions WHERE reference_id=? AND kind=? AND status='PROCESSED'`,
             [reference.id, p.kind],
           );
           if (reversed.length) failure = 'ALREADY_REVERSED';
-          if (p.kind === 'ROLLBACK')
-            direction =
-              reference.kind === 'BET'
-                ? LedgerDirection.Credit
-                : LedgerDirection.Debit;
+          direction = WagerRules.direction(p.kind, reference.kind);
         }
       }
     }
@@ -315,10 +306,7 @@ export class WageringService {
         direction === LedgerDirection.Debit &&
         wallet.balance.isLessThan(money)
       )
-        failure =
-          p.kind === 'BET'
-            ? 'INSUFFICIENT_FUNDS'
-            : 'REVERSAL_INSUFFICIENT_FUNDS';
+        failure = WagerRules.insufficientFunds(p.kind);
       else if (
         direction === LedgerDirection.Credit &&
         wallet.balance.add(money).toJSON().amount.split('.')[0].length > 16
@@ -501,7 +489,8 @@ export class WageringService {
         if (
           decoded.walletId !== id ||
           typeof decoded.sequence !== 'string' ||
-          !/^\d+$/.test(decoded.sequence)
+          !/^\d{1,19}$/.test(decoded.sequence) ||
+          BigInt(decoded.sequence) > 9223372036854775807n
         )
           throw new Error();
         sequence = decoded.sequence;

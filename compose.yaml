@@ -6,7 +6,7 @@ services:
 
     environment:
       POSTGRES_USER: jungle
-      POSTGRES_PASSWORD: jungle
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-jungle_dev}
       POSTGRES_DB: wagering
 
     ports:

@@ -10,6 +10,7 @@ import {
   ReceiveMessageCommand,
   SendMessageCommand,
   ChangeMessageVisibilityCommand,
+  DeleteMessageCommand,
 } from '@aws-sdk/client-sqs';
 
 describe('Real PostgreSQL and SQS', () => {
@@ -72,7 +73,10 @@ describe('Real PostgreSQL and SQS', () => {
     await expect(
       orm.em
         .fork()
-        .execute('UPDATE wallets SET balance=101 WHERE id=?', [w.id]),
+        .execute(
+          'UPDATE wallets SET balance=101,version=version+1 WHERE id=?',
+          [w.id],
+        ),
     ).rejects.toThrow('WALLET_LEDGER_MISMATCH');
     await expect(
       orm.em
@@ -84,6 +88,17 @@ describe('Real PostgreSQL and SQS', () => {
         .fork()
         .execute('DELETE FROM wallet_ledger WHERE wallet_id=?', [w.id]),
     ).rejects.toThrow('LEDGER_IMMUTABLE');
+    await expect(
+      orm.em.fork().transactional(async (em) => {
+        await em.execute('TRUNCATE wallet_ledger');
+        throw new Error('TRUNCATE_WAS_ALLOWED');
+      }),
+    ).rejects.toThrow('LEDGER_IMMUTABLE');
+    await expect(
+      orm.em
+        .fork()
+        .execute('UPDATE wallets SET version=version+1 WHERE id=?', [w.id]),
+    ).rejects.toThrow('INVALID_WALLET_VERSION');
   });
   it('50 parallel duplicates produce one debit and historical replay', async () => {
     const w = await wallet();
@@ -291,6 +306,56 @@ describe('Real PostgreSQL and SQS', () => {
     await messaging.consume(redelivery.Messages![0]);
     expect((await service.getWallet(w.id)).balance.amount).toBe('75.00');
   });
+  it('transient processing failure retries with real visibility and exhausts into DLQ', async () => {
+    const p = input({ id: randomUUID(), playerId: randomUUID() });
+    const body = JSON.stringify({
+      messageId: randomUUID(),
+      type: 'WagerTransactionRequested',
+      occurredAt: new Date().toISOString(),
+      data: { ...p, idempotencyKey: p.externalTransactionId },
+    });
+    await messaging.sqs.send(
+      new SendMessageCommand({
+        QueueUrl: messaging.queueUrl,
+        MessageGroupId: p.walletId,
+        MessageDeduplicationId: randomUUID(),
+        MessageBody: body,
+      }),
+    );
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      let received;
+      for (let i = 0; i < 8; i++) {
+        const r = await messaging.sqs.send(
+          new ReceiveMessageCommand({
+            QueueUrl: messaging.queueUrl,
+            WaitTimeSeconds: 1,
+            MessageSystemAttributeNames: ['ApproximateReceiveCount'],
+          }),
+        );
+        if (r.Messages?.length) {
+          received = r.Messages[0];
+          break;
+        }
+      }
+      expect(received?.Attributes?.ApproximateReceiveCount).toBe(
+        String(attempt),
+      );
+      await messaging.consume(received);
+    }
+    const dlq = await messaging.sqs.send(
+      new ReceiveMessageCommand({
+        QueueUrl: messaging.dlqUrl,
+        WaitTimeSeconds: 1,
+      }),
+    );
+    expect(dlq.Messages?.[0].Body).toBe(body);
+    await messaging.sqs.send(
+      new DeleteMessageCommand({
+        QueueUrl: messaging.dlqUrl,
+        ReceiptHandle: dlq.Messages![0].ReceiptHandle,
+      }),
+    );
+  }, 20000);
   it('permanent malformed message reaches real DLQ', async () => {
     await messaging.sqs.send(
       new SendMessageCommand({
@@ -316,9 +381,14 @@ describe('Real PostgreSQL and SQS', () => {
     expect(dlq.Messages?.length).toBeGreaterThan(0);
   });
   it('two publishers drain committed outbox with stable event identities', async () => {
+    // Ensure both publishers claim real work, even if earlier batches were drained.
+    await Promise.all(Array.from({ length: 30 }, () => wallet()));
     const other = new Messaging(orm, service, new Telemetry());
     other.eventsUrl = messaging.eventsUrl;
     try {
+      const claimed = await Promise.all([messaging.publish(), other.publish()]);
+      expect(claimed[0]).toBeGreaterThan(0);
+      expect(claimed[1]).toBeGreaterThan(0);
       for (let i = 0; i < 30; i++) {
         await Promise.all([messaging.publish(), other.publish()]);
         const [r] = await query<{ n: string }>(
@@ -336,4 +406,39 @@ describe('Real PostgreSQL and SQS', () => {
       await other.onApplicationShutdown();
     }
   }, 30000);
+  it('failed publication is retained and recovered by a later publisher', async () => {
+    const w = await wallet();
+    const failing = new Messaging(orm, service, new Telemetry());
+    failing.eventsUrl = messaging.eventsUrl.replace(
+      /[^/]+$/,
+      `missing-${randomUUID()}.fifo`,
+    );
+    try {
+      await failing.publish();
+      const rows = await query<{ attempts: number; published_at: Date | null }>(
+        orm.em.fork(),
+        'SELECT attempts,published_at FROM outbox WHERE aggregate_id=?',
+        [w.id],
+      );
+      expect(rows).toHaveLength(2);
+      expect(
+        rows.every((r) => r.attempts === 1 && r.published_at === null),
+      ).toBe(true);
+      await orm.em
+        .fork()
+        .execute(
+          'UPDATE outbox SET next_attempt_at=now() WHERE aggregate_id=?',
+          [w.id],
+        );
+      await messaging.publish();
+      const published = await query<{ published_at: Date | null }>(
+        orm.em.fork(),
+        'SELECT published_at FROM outbox WHERE aggregate_id=?',
+        [w.id],
+      );
+      expect(published.every((r) => r.published_at !== null)).toBe(true);
+    } finally {
+      await failing.onApplicationShutdown();
+    }
+  });
 });

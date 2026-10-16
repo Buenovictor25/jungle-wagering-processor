@@ -1,5 +1,7 @@
 import Decimal from 'decimal.js';
 
+const supportedCurrencies = new Set(Intl.supportedValuesOf('currency'));
+
 export interface MoneyProps {
   amount: string;
   currency: string;
@@ -22,7 +24,8 @@ export class Money {
 
     if (
       typeof props.currency !== 'string' ||
-      !/^[A-Z]{3}$/.test(props.currency)
+      !/^[A-Z]{3}$/.test(props.currency) ||
+      !supportedCurrencies.has(props.currency)
     ) {
       throw new Error('INVALID_CURRENCY');
     }

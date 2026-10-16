@@ -2,6 +2,21 @@ import { describe, expect, it } from '@jest/globals';
 import { Money } from './money';
 
 describe('Money', () => {
+  it('rejects an unknown ISO currency code', () => {
+    expect(() => Money.from({ amount: '1.00', currency: 'ZZZ' })).toThrow(
+      'INVALID_CURRENCY',
+    );
+  });
+  it('preserves cents near the PostgreSQL numeric boundary', () => {
+    const money = Money.from({
+      amount: '9999999999999999.98',
+      currency: 'BRL',
+    });
+    expect(
+      money.add(Money.from({ amount: '0.01', currency: 'BRL' })).toJSON()
+        .amount,
+    ).toBe('9999999999999999.99');
+  });
   it('normalizes valid decimal amounts', () => {
     expect(Money.from({ amount: '25', currency: 'BRL' }).toJSON()).toEqual({
       amount: '25.00',

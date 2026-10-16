@@ -678,6 +678,16 @@
       ],
       "triggers": [
         {
+          "name": "transaction_ledger_consistency",
+          "timing": "after",
+          "events": [
+            "insert",
+            "update"
+          ],
+          "forEach": "row",
+          "body": ""
+        },
+        {
           "name": "transaction_terminal",
           "timing": "before",
           "events": [
@@ -1179,6 +1189,15 @@
           "timing": "after",
           "events": [
             "insert",
+            "update"
+          ],
+          "forEach": "row",
+          "body": ""
+        },
+        {
+          "name": "wallet_transition",
+          "timing": "before",
+          "events": [
             "update"
           ],
           "forEach": "row",
